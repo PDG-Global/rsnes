@@ -168,15 +168,20 @@ impl Bus {
             (_, 0x4016) if is_mmio_bank(b) => {
                 // joypad 1 serial
                 if self.pad_latch & 1 != 0 {
-                    self.open_bus = 1;
-                    return 1;
+                    // While the latch line is held, the pad continuously
+                    // reloads: reads return the current first bit (B).
+                    return (self.pad1_bits >> 15) as u8;
                 }
                 let bit = (self.pad1_shift & 0x8000) >> 15;
                 self.pad1_shift = (self.pad1_shift << 1) | 1;
                 self.open_bus = bit as u8;
                 return self.open_bus;
             }
-            (_, 0x4017) if is_mmio_bank(b) => 1,
+            (_, 0x4017) if is_mmio_bank(b) => {
+                // No controller on port 2: data bits 0-1 read 0, bits 2-4
+                // read 1, upper bits open bus (matches snes9x JOYSER1).
+                (self.open_bus & !0x03) | 0x1C
+            }
             (_, 0x4200..=0x421F) if is_mmio_bank(b) => self.read_system(addr),
             (_, 0x4300..=0x437F) if is_mmio_bank(b) => self.read_dma(addr),
             // SRAM (LoROM): banks $70-$7D (and mirrors $F0-$FD), $0000-$FFFF

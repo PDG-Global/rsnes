@@ -64,7 +64,7 @@ fn smw_gameplay_state() {
         (6650, RIGHT),      // stop jumping once inside, keep running
     ];
     let dump_frames: &[u64] = &[
-        2000, 2400, 2600, 2650, 2700, 2750,
+        2000, 2400, 2600,
         4000, 4500, 5000, 5500, 5800,
         6000, 6400,
         6680, 6700, 6720, 6740, 6760, 6780, 6800, 6850, 6900, 7000, 7100, 7200, 7500, 7600,
@@ -245,4 +245,148 @@ fn run_and_dump(rom_path: &str, label: &str, targets: &[u64]) {
         eprintln!("wram[0490..04B0]={:02X?}", &w[0x0490..0x04B0]);
         dump_png(&snes, &format!("/tmp/{}_f{}.rgb", label, target));
     }
+}
+/// Reproduce the "map loads weird" report: navigate the menus, then mash
+/// START/B through the welcome cutscene like an impatient player, dumping
+/// frames + game mode around the map arrival.
+#[test]
+fn smw_map_load_mash() {
+    const START: u16 = 1 << 12;
+    const B: u16 = 1 << 15;
+    let rom_path = format!(
+        "{}/../../roms/Super Mario World (USA).sfc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let Ok(data) = std::fs::read(&rom_path) else {
+        eprintln!("ROM not found at {rom_path}; skipping");
+        return;
+    };
+    let cart = snes_core::cartridge::Cartridge::load(&data).unwrap();
+    let mut snes = Snes::new(cart);
+    snes.reset();
+
+    let menu: &[(u64, u16)] = &[(1300, START), (1315, 0), (1600, START), (1615, 0)];
+    let mut idx = 0;
+    let mut next_dump = 3600u64;
+    while snes.frame_count < 5200 {
+        if idx < menu.len() && snes.frame_count == menu[idx].0 {
+            snes.bus.set_pad1(menu[idx].1);
+            idx += 1;
+        }
+        // From f1700 on, alternate mashing START and B every ~18 frames.
+        if snes.frame_count >= 1700 {
+            let phase = (snes.frame_count / 18) % 4;
+            let btn = match phase {
+                0 => START,
+                2 => B,
+                _ => 0,
+            };
+            snes.bus.set_pad1(btn);
+        }
+        snes.bus.frame_ready = false;
+        while !snes.bus.frame_ready {
+            snes.step();
+        }
+        snes.bus.frame_ready = false;
+        snes.frame_count += 1;
+
+        if snes.frame_count >= next_dump {
+            next_dump += 50;
+            let p = &snes.bus.ppu;
+            let w = &snes.bus.wram;
+            eprintln!(
+                "f{} mode($0100)={:02X} inidisp={:02X} tm={:02X} ts={:02X} tmw={:02X} tsw={:02X} cgwsel={:02X} bgmode={:02X} y={:04X}",
+                snes.frame_count, w[0x100], p.inidisp, p.tm, p.ts, p.tmw, p.tsw, p.cgwsel,
+                p.bgmode,
+                w[0x96] as u16 | (w[0x97] as u16) << 8,
+            );
+            dump_png(&snes, &format!("/tmp/mash_f{}.rgb", snes.frame_count));
+        }
+    }
+}
+
+/// Reproduce: idle at the title screen long enough for the attract demo to
+/// play, then start a new game — the map loads broken (waves + wrong tiles).
+#[test]
+fn smw_map_after_demo() {
+    const START: u16 = 1 << 12;
+    const B: u16 = 1 << 15;
+    let rom_path = format!(
+        "{}/../../roms/Super Mario World (USA).sfc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let Ok(data) = std::fs::read(&rom_path) else {
+        eprintln!("ROM not found at {rom_path}; skipping");
+        return;
+    };
+    let cart = snes_core::cartridge::Cartridge::load(&data).unwrap();
+    let mut snes = Snes::new(cart);
+    snes.reset();
+
+    // Idle until f7000 (well into the attract demo), then:
+    // START -> file select, START -> file A (empty) -> 1P/2P screen,
+    // START -> 1 player -> welcome cutscene -> map.
+    let menu: &[(u64, u16)] = &[
+        (7000, START),
+        (7015, 0),
+        (7400, START),
+        (7415, 0),
+        (7800, START),
+        (7815, 0),
+        (8200, B),  // dismiss welcome message
+        (8215, 0),
+        (9000, B),  // in case the first tap was early
+        (9015, 0),
+    ];
+    let mut idx = 0;
+    let mut next_dump = 1400u64;
+    while snes.frame_count < 12000 {
+        if idx < menu.len() && snes.frame_count == menu[idx].0 {
+            snes.bus.set_pad1(menu[idx].1);
+            idx += 1;
+        }
+        snes.bus.frame_ready = false;
+        while !snes.bus.frame_ready {
+            snes.step();
+        }
+        snes.bus.frame_ready = false;
+        snes.frame_count += 1;
+
+        let in_window = (snes.frame_count >= 1400 && snes.frame_count <= 2600)
+            || (snes.frame_count >= 6000 && snes.frame_count <= 7000)
+            || snes.frame_count >= 8000;
+        if in_window && snes.frame_count >= next_dump {
+            next_dump += if snes.frame_count < 8000 { 200 } else { 50 };
+            let p = &snes.bus.ppu;
+            let w = &snes.bus.wram;
+            eprintln!(
+                "f{} mode($0100)={:02X} inidisp={:02X} tm={:02X} ts={:02X} tmw={:02X} tsw={:02X} bgmode={:02X} y={:04X} \
+                 $15={:02X} $16={:02X} $17={:02X} $18={:02X} pad={:04X} $1426={:02X} $1B88={:02X} $1B89={:02X}",
+                snes.frame_count, w[0x100], p.inidisp, p.tm, p.ts, p.tmw, p.tsw,
+                p.bgmode,
+                w[0x96] as u16 | (w[0x97] as u16) << 8,
+                w[0x15], w[0x16], w[0x17], w[0x18],
+                snes.bus.debug_pad1(),
+                w[0x1426], w[0x1B88], w[0x1B89],
+            );
+            dump_png(&snes, &format!("/tmp/demo_f{}.rgb", snes.frame_count));
+        }
+    }
+
+    // Regression: $0DA0 selects the controller port the game listens to. A
+    // broken $4017 read (port 2) used to flip it to pad 2 after map loads,
+    // killing all input. The game must end on the map, listening to pad 1.
+    let w = &snes.bus.wram;
+    assert_eq!(
+        w[0xDA0],
+        0,
+        "controller port select $0DA0 must be pad 1 (got {:02X})",
+        w[0xDA0]
+    );
+    assert_eq!(
+        w[0x100],
+        0x0E,
+        "game mode $0100 must be the overworld map (got {:02X})",
+        w[0x100]
+    );
 }
