@@ -1,0 +1,15 @@
+# Rust build output
+/target
+
+# snes9x reference source (local checkout, not ours to distribute)
+/snes9x
+/snes9x-harness
+
+# ROMs — copyrighted game images, never commit these
+/roms
+
+# OS / editor junk
+.DS_Store
+
+# local tooling state
+/.mimocode

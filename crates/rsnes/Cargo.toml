@@ -1,0 +1,8 @@
+[package]
+name = "rsnes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+snes-core = { path = "../snes-core" }
+sdl3-sys = "0.6"
