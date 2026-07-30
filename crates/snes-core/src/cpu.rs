@@ -999,9 +999,9 @@ pub fn step(cpu: &mut Cpu, bus: &mut Bus) -> u64 {
         0x6C => { let a = cpu.fetch16(bus); cpu.pc = cpu.read16(bus, a as u32); cpu.cycles += 5; }
         0x7C => { let a = cpu.fetch16(bus).wrapping_add(cpu.x); let ptr = (cpu.pb as u32) << 16 | a as u32; cpu.pc = cpu.read16(bus, ptr); cpu.cycles += 6; }
         0xDC => {
-            // JML [d]: 8-bit direct operand; the 24-bit target is read from D+d.
-            let d = cpu.fetch8(bus) as u16;
-            let a = cpu.dp_addr(d);
+            // JML [a]: 16-bit absolute operand; the 24-bit target is read
+            // from bank 0 at address a (65816 has no direct-page JML).
+            let a = cpu.fetch16(bus) as u32;
             let lo = cpu.read(bus, a) as u32;
             let mid = cpu.read(bus, (a + 1) & 0xFFFF) as u32;
             let hi = cpu.read(bus, (a + 2) & 0xFFFF) as u32;

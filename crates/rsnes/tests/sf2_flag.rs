@@ -590,7 +590,6 @@ fn sf2_0bec_trace() {
     let mut irq_entries = 0u32;
     for frame in 1..=540u64 {
         snes.bus.frame_ready = false;
-        snes.bus.dbg_wram_watch = (480..530).contains(&frame);
         while !snes.bus.frame_ready {
             if snes.cpu.pc == 0x84FF && snes.cpu.pb == 0 {
                 irq_entries += 1;

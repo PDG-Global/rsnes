@@ -414,6 +414,15 @@ impl Ppu {
                     self.bg_vofs[idx] = val16 & 0x3FF;
                 }
                 self.ofs_latch = v;
+                // $210D/$210E double as M7HOFS/M7VOFS, sharing the mode 7
+                // write-twice latch with $211B-$2120.
+                if addr == 0x210D {
+                    self.m7[6] = ((v as u16) << 8) | self.m7_latch as u16;
+                    self.m7_latch = v;
+                } else if addr == 0x210E {
+                    self.m7[7] = ((v as u16) << 8) | self.m7_latch as u16;
+                    self.m7_latch = v;
+                }
             }
             0x2115 => self.vmain = v,
             0x2116 => {
@@ -583,7 +592,9 @@ impl Ppu {
             return (0, pri);
         }
         let pal_base = match bpp {
-            2 => pal * 4,
+            // 2bpp BGs each own a 32-color CGRAM region (BG1: 0-31, BG2:
+            // 32-63, BG3: 64-95, BG4: 96-127); snes9x DO_BG StartPalette.
+            2 => layer as u8 * 32 + pal * 4,
             4 => pal * 16,
             _ => 0,
         };

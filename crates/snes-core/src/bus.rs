@@ -52,7 +52,6 @@ pub struct Bus {
     /// Last value driven on the data bus (open bus behavior for unmapped reads).
     open_bus: u8,
     pub dbg_pc: u32, // debug: current CPU pc for MMIO read logging
-    pub dbg_wram_watch: bool, // debug: log writes to $0BEA-$0BEF
 
     // --- DMA ---
     dma_channels: [DmaChannel; 8],
@@ -110,7 +109,6 @@ impl Bus {
             frame_ready: false,
             open_bus: 0,
             dbg_pc: 0,
-            dbg_wram_watch: false,
             dma_channels: [DmaChannel::default(); 8],
             hdma_active: 0,
             mdma_pending: false,
@@ -236,24 +234,22 @@ impl Bus {
     pub fn write(&mut self, bank: u8, addr: u16, value: u8) {
         let (b, a) = (bank as usize, addr as usize);
         if a < 0x2000 && (b < 0x40 || (0x80..0xC0).contains(&b)) {
-            if self.dbg_wram_watch && (0x0BEA..=0x0BEF).contains(&a) {
-                eprintln!(
-                    "WRAM ${:04X}={:02X} pc={:06X} f{} l{}",
-                    a, value, self.dbg_pc, self.ppu.frame, self.ppu.line
-                );
-            }
             self.wram[a] = value;
             return;
         }
         match (bank, addr) {
-            (0x7E..=0x7F, _) => self.wram[((b - 0x7E) << 16) | a] = value,
+            (0x7E..=0x7F, _) => {
+                let wa = (((b - 0x7E) << 16) | a) as usize;
+                self.wram[wa] = value;
+            }
             (_, 0x2100..=0x213F) if is_mmio_bank(b) => {
                 self.ppu.dbg_pc = self.dbg_pc;
                 self.ppu.write_register(addr, value);
             }
             (_, 0x2140..=0x217F) if is_mmio_bank(b) => self.spc.write_port((addr & 3) as u8, value),
             (_, 0x2180) if is_mmio_bank(b) => {
-                self.wram[(self.wram_addr & 0x1FFFF) as usize] = value;
+                let wa = (self.wram_addr & 0x1FFFF) as usize;
+                self.wram[wa] = value;
                 self.wram_addr = self.wram_addr.wrapping_add(1) & 0x1FFFF;
             }
             (_, 0x2181) if is_mmio_bank(b) => self.wram_addr = (self.wram_addr & !0xFF) | value as u32,
@@ -366,17 +362,13 @@ impl Bus {
             0x4209 => self.vtime = (self.vtime & 0xFF00) | value as u16,
             0x420A => self.vtime = (self.vtime & 0x00FF) | ((value as u16 & 1) << 8),
             0x420B => {
-                // general DMA enable — accumulate cycles and tick PPU
-                let mut total_dma_cycles: u64 = 0;
+                // general DMA enable — run_dma ticks PPU/APU per byte (and
+                // services per-scanline HDMA inline), so no extra bulk tick
+                // here or DMA time would be double-counted.
                 for ch in 0..8 {
                     if value >> ch & 1 != 0 {
-                        total_dma_cycles += self.run_dma(ch);
+                        self.run_dma(ch);
                     }
-                }
-                // Apply DMA cycles to PPU (DMA stalls the CPU)
-                if total_dma_cycles > 0 {
-                    self.ppu.tick(total_dma_cycles);
-                    self.spc.tick(total_dma_cycles);
                 }
             }
             0x420C => self.hdma_active = value,
@@ -498,8 +490,15 @@ impl Bus {
             self.spc.tick(8);
             cycles += 8;
             // Hardware DMA runs to completion even across a frame boundary;
-            // pending NMI/HDMA/frame events are latched by ppu.tick() and
-            // handled by poll_interrupts() once the transfer finishes.
+            // pending NMI/frame events are latched by ppu.tick() and handled
+            // by poll_interrupts() once the transfer finishes. HDMA is
+            // different: it fires once per scanline, so a long DMA spanning
+            // several scanlines must service it inline — coalescing the
+            // hdma_due flag would drop line counts and desync per-scanline
+            // HDMA tables (e.g. Mario Kart's Mode 7 matrix).
+            if self.ppu.take_hdma_due() {
+                self.run_hdma();
+            }
         }
         self.dma_channels[ch].a_addr = a_addr;
         self.mdma_pending = true;
