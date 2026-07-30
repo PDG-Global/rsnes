@@ -1,3 +1,4 @@
+use sdl3_sys::audio::*;
 use sdl3_sys::events::*;
 use sdl3_sys::init::*;
 use sdl3_sys::keycode::*;
@@ -43,7 +44,7 @@ fn main() {
     snes.reset();
 
     unsafe {
-        if !SDL_Init(SDL_INIT_VIDEO) {
+        if !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) {
             panic!("SDL_Init failed");
         }
 
@@ -74,6 +75,36 @@ fn main() {
             panic!("SDL_CreateTexture failed");
         }
         SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+
+        // Audio: 32 kHz stereo S16 from the S-DSP, pushed once per frame.
+        let spec = SDL_AudioSpec {
+            format: SDL_AUDIO_S16LE,
+            channels: 2,
+            freq: 32000,
+        };
+        let audio = SDL_OpenAudioDeviceStream(
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+            &spec,
+            None,
+            ptr::null_mut(),
+        );
+        if audio.is_null() {
+            eprintln!("warning: SDL_OpenAudioDeviceStream failed; running mute");
+        } else {
+            SDL_ResumeAudioStreamDevice(audio);
+        }
+        let mut samples: Vec<(i16, i16)> = Vec::with_capacity(2048);
+        const FRAME_BYTES: i32 = 32000 * 4 / 60;
+        // Pace against the audio queue: keep ~3 frames buffered. If we fall
+        // behind, run frames back-to-back to catch up; the audio clock is
+        // the real pacemaker. Clear only as a last resort (~10 frames).
+        const TARGET_QUEUED: i32 = FRAME_BYTES * 3;
+        const MAX_QUEUED: i32 = FRAME_BYTES * 10;
+        // Prebuffer so the stream never starts empty (underrun = crackle).
+        if !audio.is_null() {
+            let silence = [0i16; (FRAME_BYTES / 2) as usize];
+            SDL_PutAudioStreamData(audio, silence.as_ptr() as *const _, (silence.len() * 2) as i32);
+        }
 
         let mut running = true;
         let mut paused = false;
@@ -116,6 +147,22 @@ fn main() {
                 }
             }
 
+            // Audio
+            if !audio.is_null() {
+                snes.bus.spc.dsp.drain(&mut samples);
+                if !samples.is_empty() {
+                    SDL_PutAudioStreamData(
+                        audio,
+                        samples.as_ptr() as *const _,
+                        (samples.len() * 4) as i32,
+                    );
+                    samples.clear();
+                }
+                if SDL_GetAudioStreamQueued(audio) > MAX_QUEUED {
+                    SDL_ClearAudioStream(audio);
+                }
+            }
+
             // Presentation
             let fb = snes.framebuffer();
             SDL_UpdateTexture(
@@ -129,13 +176,22 @@ fn main() {
             SDL_RenderTexture(renderer, texture, ptr::null(), ptr::null());
             SDL_RenderPresent(renderer);
 
-            // Frame pacing
+            // Frame pacing: when the audio queue is healthy, sleep out the
+            // frame; when it's running dry, catch up as fast as we can.
+            let audio_ok = !audio.is_null() && SDL_GetAudioStreamQueued(audio) > TARGET_QUEUED;
             let elapsed = frame_start.elapsed();
-            if elapsed < FRAME_DURATION {
-                std::thread::sleep(FRAME_DURATION - elapsed);
+            if audio.is_null() || audio_ok {
+                if elapsed < FRAME_DURATION {
+                    std::thread::sleep(FRAME_DURATION - elapsed);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
 
+        if !audio.is_null() {
+            SDL_DestroyAudioStream(audio);
+        }
         SDL_DestroyTexture(texture);
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);

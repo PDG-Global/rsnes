@@ -3,7 +3,8 @@
 //! Timing model: the CPU reports cycles per instruction; the bus converts
 //! them to master clocks (x8 approximation) and ticks the PPU/APU.
 
-use crate::cartridge::Cartridge;
+use crate::cartridge::{Cartridge, MapMode};
+use crate::dsp1::Dsp1;
 use crate::ppu::Ppu;
 use crate::spc700::Spc700;
 
@@ -19,14 +20,19 @@ pub struct Bus {
     pub sram: Vec<u8>,
     pub ppu: Ppu,
     pub spc: Spc700,
+    /// DSP-1 math coprocessor (cart types $03-$05). Only the HiROM register
+    /// mapping is implemented (Super Mario Kart); LoROM DSP-1 mappings are not.
+    pub dsp1: Option<Dsp1>,
+    /// HiROM carts with on-cart RAM map SRAM at banks $20-$3F/$A0-$BF, $6000-$7FFF.
+    hirom_sram: bool,
 
     // --- WRAM port ($2180-$2183) ---
     wram_addr: u32,
 
     // --- system registers ---
     pub nmitimen: u8, // $4200
-    htime: u16,   // $4207/8
-    vtime: u16,   // $4209/A
+    pub htime: u16,   // $4207/8
+    pub vtime: u16,   // $4209/A
     mult_a: u8,   // $4202
     dividend: u16, // $4204/5
     mult_result: u16, // $4214/5 (also quotient)
@@ -45,6 +51,8 @@ pub struct Bus {
 
     /// Last value driven on the data bus (open bus behavior for unmapped reads).
     open_bus: u8,
+    pub dbg_pc: u32, // debug: current CPU pc for MMIO read logging
+    pub dbg_wram_watch: bool, // debug: log writes to $0BEA-$0BEF
 
     // --- DMA ---
     dma_channels: [DmaChannel; 8],
@@ -69,12 +77,20 @@ struct DmaChannel {
 
 impl Bus {
     pub fn new(rom: Cartridge) -> Self {
+        let cart_type = rom.cart_type();
+        let is_hirom = rom.map_mode() == MapMode::HiRom;
         Self {
             rom,
             wram: Box::new([0; 0x20000]),
             sram: vec![0; 0x2000],
             ppu: Ppu::new(),
             spc: Spc700::new(),
+            dsp1: if matches!(cart_type, 0x03 | 0x04 | 0x05) {
+                Some(Dsp1::new())
+            } else {
+                None
+            },
+            hirom_sram: is_hirom && matches!(cart_type, 0x02 | 0x05),
             wram_addr: 0,
             nmitimen: 0,
             htime: 0x1FF,
@@ -93,6 +109,8 @@ impl Bus {
             irq_line: false,
             frame_ready: false,
             open_bus: 0,
+            dbg_pc: 0,
+            dbg_wram_watch: false,
             dma_channels: [DmaChannel::default(); 8],
             hdma_active: 0,
             mdma_pending: false,
@@ -184,6 +202,19 @@ impl Bus {
             }
             (_, 0x4200..=0x421F) if is_mmio_bank(b) => self.read_system(addr),
             (_, 0x4300..=0x437F) if is_mmio_bank(b) => self.read_dma(addr),
+            // DSP-1 (HiROM): banks $00-$1F/$80-$9F, $6000-$7FFF.
+            // Takes precedence over ROM reads in that range (Mario Kart
+            // polls its DSP at $00:6000).
+            (0x00..=0x1F | 0x80..=0x9F, 0x6000..=0x7FFF) if self.dsp1.is_some() => {
+                self.dsp1.as_mut().unwrap().get_byte(addr)
+            }
+            // SRAM (HiROM): banks $20-$3F/$A0-$BF, $6000-$7FFF
+            (0x20..=0x3F | 0xA0..=0xBF, 0x6000..=0x7FFF)
+                if self.hirom_sram && !self.sram.is_empty() =>
+            {
+                let off = (((b & 0x0F) << 13) | (a & 0x1FFF)) % self.sram.len();
+                self.sram[off]
+            }
             // SRAM (LoROM): banks $70-$7D (and mirrors $F0-$FD), $0000-$FFFF
             // Address formula matches snes9x: ((bank << 15) | (addr & 0x7FFF)) & SRAMMask
             (0x70..=0x7D | 0xF0..=0xFD, _) if !self.sram.is_empty() => {
@@ -205,12 +236,21 @@ impl Bus {
     pub fn write(&mut self, bank: u8, addr: u16, value: u8) {
         let (b, a) = (bank as usize, addr as usize);
         if a < 0x2000 && (b < 0x40 || (0x80..0xC0).contains(&b)) {
+            if self.dbg_wram_watch && (0x0BEA..=0x0BEF).contains(&a) {
+                eprintln!(
+                    "WRAM ${:04X}={:02X} pc={:06X} f{} l{}",
+                    a, value, self.dbg_pc, self.ppu.frame, self.ppu.line
+                );
+            }
             self.wram[a] = value;
             return;
         }
         match (bank, addr) {
             (0x7E..=0x7F, _) => self.wram[((b - 0x7E) << 16) | a] = value,
-            (_, 0x2100..=0x213F) if is_mmio_bank(b) => self.ppu.write_register(addr, value),
+            (_, 0x2100..=0x213F) if is_mmio_bank(b) => {
+                self.ppu.dbg_pc = self.dbg_pc;
+                self.ppu.write_register(addr, value);
+            }
             (_, 0x2140..=0x217F) if is_mmio_bank(b) => self.spc.write_port((addr & 3) as u8, value),
             (_, 0x2180) if is_mmio_bank(b) => {
                 self.wram[(self.wram_addr & 0x1FFFF) as usize] = value;
@@ -235,6 +275,17 @@ impl Bus {
             }
             (_, 0x4200..=0x421F) if is_mmio_bank(b) => self.write_system(addr, value),
             (_, 0x4300..=0x437F) if is_mmio_bank(b) => self.write_dma(addr, value),
+            // DSP-1 (HiROM): banks $00-$1F/$80-$9F, $6000-$7FFF
+            (0x00..=0x1F | 0x80..=0x9F, 0x6000..=0x7FFF) if self.dsp1.is_some() => {
+                self.dsp1.as_mut().unwrap().set_byte(value, addr);
+            }
+            // SRAM (HiROM): banks $20-$3F/$A0-$BF, $6000-$7FFF
+            (0x20..=0x3F | 0xA0..=0xBF, 0x6000..=0x7FFF)
+                if self.hirom_sram && !self.sram.is_empty() =>
+            {
+                let off = (((b & 0x0F) << 13) | (a & 0x1FFF)) % self.sram.len();
+                self.sram[off] = value;
+            }
             (0x70..=0x7D | 0xF0..=0xFD, _) if !self.sram.is_empty() => {
                 let off = (((b & 0xF) << 15) | (a & 0x7FFF)) % self.sram.len();
                 self.sram[off] = value;
@@ -254,6 +305,8 @@ impl Bus {
             0x4211 => {
                 let v = if self.irq_pending_flag { 0x80 } else { 0 };
                 self.irq_pending_flag = false;
+                // TIMEUP read acknowledges the level-triggered IRQ line
+                self.irq_line = false;
                 v
             }
             0x4212 => {
@@ -351,8 +404,12 @@ impl Bus {
             0x5 => d.size as u8,
             0x6 => (d.size >> 8) as u8,
             0x7 => d.hdma_bank,
-            0x8 => d.line_count,
-            0x9 => d.unused,
+            // $43x8/9 are the *current* HDMA table address (A2A), $43xA the
+            // line counter; $43xB/F return the written "unknown" byte.
+            0x8 => d.hdma_a as u8,
+            0x9 => (d.hdma_a >> 8) as u8,
+            0xA => d.line_count,
+            0xB | 0xF => d.unused,
             _ => 0,
         }
     }
@@ -372,8 +429,21 @@ impl Bus {
             0x5 => d.size = (d.size & 0xFF00) | value as u16,
             0x6 => d.size = (d.size & 0x00FF) | (value as u16) << 8,
             0x7 => d.hdma_bank = value,
-            0x8 => d.line_count = value,
-            0x9 => d.unused = value,
+            // $43x8/9 (A2AxL/H): current HDMA table address — NOT the line
+            // counter. Games reposition the channel mid-table with these.
+            0x8 => d.hdma_a = (d.hdma_a & 0xFF00) | value as u16,
+            0x9 => d.hdma_a = (d.hdma_a & 0x00FF) | (value as u16) << 8,
+            // $43xA (NLTRx): HDMA line counter. Same format as a table count
+            // byte: bit 7 = transfer every line, low 7 bits = line count.
+            // A zero count encodes 128 lines (clamped to 127 here).
+            0xA => {
+                if value & 0x7F != 0 {
+                    d.line_count = value;
+                } else {
+                    d.line_count = (if value & 0x80 != 0 { 0 } else { 0x80 }) | 0x7F;
+                }
+            }
+            0xB | 0xF => d.unused = value,
             _ => {}
         }
     }
@@ -427,14 +497,43 @@ impl Bus {
             self.ppu.tick(8);
             self.spc.tick(8);
             cycles += 8;
-            // Check if PPU triggered frame end or HDMA during DMA
-            if self.ppu.frame_ended {
-                break;
-            }
+            // Hardware DMA runs to completion even across a frame boundary;
+            // pending NMI/HDMA/frame events are latched by ppu.tick() and
+            // handled by poll_interrupts() once the transfer finishes.
         }
         self.dma_channels[ch].a_addr = a_addr;
         self.mdma_pending = true;
         cycles
+    }
+
+    /// Debug: dump HDMA enable mask and channel internals.
+    pub fn debug_hdma(&self) -> String {
+        let mut s = format!("hdma_active={:02X}", self.hdma_active);
+        for ch in 0..8 {
+            let d = &self.dma_channels[ch];
+            s += &format!(
+                " ch{}[ctrl={:02X} breg={:02X} a={:02X}:{:04X} size={:04X} ibank={:02X} lc={:02X} ha={:04X} dt={}]",
+                ch, d.control, d.b_reg, d.a_bank, d.a_addr, d.size, d.hdma_bank,
+                d.line_count, d.hdma_a, d.hdma_do_transfer
+            );
+        }
+        s
+    }
+
+    /// Debug: raw table bytes for the channel targeting B-register `breg`.
+    pub fn debug_hdma_table(&mut self, breg: u8) -> String {
+        for ch in 0..8 {
+            let d = self.dma_channels[ch];
+            if d.b_reg == breg {
+                let mut s = format!("ch{} a={:02X}:{:04X} table:", ch, d.a_bank, d.a_addr);
+                for i in 0..24u16 {
+                    let v = self.read(d.a_bank, d.a_addr.wrapping_add(i));
+                    s += &format!(" {:02X}", v);
+                }
+                return s;
+            }
+        }
+        "no channel".to_string()
     }
 
     /// HDMA: called at the start of each visible scanline by the driver.
@@ -445,30 +544,34 @@ impl Bus {
             }
             let mut d = self.dma_channels[ch];
             if d.line_count == 0 {
-                // Frame start: internal A pointer reloads from $43x2/3 (the
-                // CPU may have written a new table address during vblank).
-                // After that, completed entries advance through the table —
-                // the pointer must NOT reset per entry.
-                if !d.hdma_do_transfer {
-                    d.hdma_a = d.a_addr;
-                    d.hdma_do_transfer = true;
-                }
-                d.line_count = self.read(d.a_bank, d.hdma_a);
+                // Load the next table entry. Frame start reloads the internal
+                // A pointer from $43x2/3 (done in hdma_frame_reset); completed
+                // entries keep advancing through the table.
+                let line = self.read(d.a_bank, d.hdma_a);
                 d.hdma_a = d.hdma_a.wrapping_add(1);
-                if d.line_count == 0 {
+                if line == 0 {
                     self.hdma_active &= !(1 << ch);
+                    d.hdma_do_transfer = false;
                     self.dma_channels[ch] = d;
                     continue;
                 }
-                if d.line_count & 0x80 != 0 {
-                    // indirect: fetch 2-byte table address
+                d.line_count = line;
+                // Indirect addressing is a property of the channel ($43x0 bit
+                // 6), NOT of the count byte: every entry carries a 2-byte
+                // data pointer in bank $43x7.
+                if d.control & 0x40 != 0 {
                     let lo = self.read(d.a_bank, d.hdma_a) as u16;
                     let hi = self.read(d.a_bank, d.hdma_a.wrapping_add(1)) as u16;
                     d.size = lo | hi << 8;
                     d.hdma_a = d.hdma_a.wrapping_add(2);
                 }
+                d.hdma_do_transfer = true;
             }
-            let indirect = d.line_count & 0x80 != 0;
+            // Count byte bit 7: SET = transfer every scanline with the data
+            // pointer advancing per line; CLEAR = transfer once on the
+            // entry's first line and hold the value for the rest.
+            let every_line = d.line_count & 0x80 != 0;
+            let indirect = d.control & 0x40 != 0;
             let mode = (d.control & 0x07) as usize;
             let to_b = d.control & 0x80 == 0;
             // bytes transferred per scanline by transfer mode
@@ -477,27 +580,30 @@ impl Bus {
                 1 | 2 | 6 => 2,
                 _ => 4,
             };
-            for i in 0..bytes {
-                let b_addr =
-                    0x2100 | (d.b_reg as u16).wrapping_add(Self::DMA_OFFSETS[mode][i & 3] as u16);
-                let (bank, addr) = if indirect {
-                    (d.hdma_bank, d.size.wrapping_add(i as u16))
+            if d.hdma_do_transfer {
+                for i in 0..bytes {
+                    let b_addr = 0x2100
+                        | (d.b_reg as u16).wrapping_add(Self::DMA_OFFSETS[mode][i & 3] as u16);
+                    let (bank, addr) = if indirect {
+                        (d.hdma_bank, d.size.wrapping_add(i as u16))
+                    } else {
+                        (d.a_bank, d.hdma_a.wrapping_add(i as u16))
+                    };
+                    let v = self.read(bank, addr);
+                    if to_b {
+                        self.write(0, b_addr, v);
+                    } else {
+                        let bv = self.read(0, b_addr);
+                        self.write(bank, addr, bv);
+                    }
+                }
+                if indirect {
+                    d.size = d.size.wrapping_add(bytes as u16);
                 } else {
-                    let a = d.hdma_a;
-                    d.hdma_a = d.hdma_a.wrapping_add(1);
-                    (d.a_bank, a)
-                };
-                let v = self.read(bank, addr);
-                if to_b {
-                    self.write(0, b_addr, v);
-                } else {
-                    let bv = self.read(0, b_addr);
-                    self.write(bank, addr, bv);
+                    d.hdma_a = d.hdma_a.wrapping_add(bytes as u16);
                 }
             }
-            if indirect {
-                d.size = d.size.wrapping_add(bytes as u16);
-            }
+            d.hdma_do_transfer = every_line;
             d.line_count = (d.line_count & 0x80) | ((d.line_count & 0x7F).wrapping_sub(1));
             if d.line_count & 0x7F == 0 {
                 d.line_count = 0;

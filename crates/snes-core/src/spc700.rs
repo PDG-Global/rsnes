@@ -46,6 +46,12 @@ pub struct Spc700 {
     master_acc: u64,
     /// SPC cycles remaining for the instruction currently executing.
     cyc: u64,
+    /// Debug: when nonzero, log every DSP write to this register address.
+    pub dbg_trace_dsp: u8,
+    /// Debug: rolling instruction trace used with `dbg_trace_dsp`.
+    pub dbg_insn_ring: Vec<String>,
+    /// Debug: when true, print every executed instruction to stderr.
+    pub dbg_trace_all: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -76,6 +82,9 @@ impl Spc700 {
             stopped: false,
             master_acc: 0,
             cyc: 0,
+            dbg_trace_dsp: 0,
+            dbg_insn_ring: Vec::new(),
+            dbg_trace_all: false,
         };
         s.reset();
         s
@@ -100,14 +109,46 @@ impl Spc700 {
         self.cpu_in[port as usize & 3] = value;
     }
 
+    /// Load a .spc sound-file snapshot (66048 bytes) into SPC+DSP state.
+    /// Used for A/B replay testing; internal DSP voice state (envelopes,
+    /// BRR rings) is not stored in the format, so output settles over ~1 s.
+    pub fn load_spc_file(&mut self, d: &[u8]) {
+        assert!(d.len() >= 0x10200 && &d[0..8] == b"SNES-SPC");
+        self.pc = d[0x25] as u16 | (d[0x26] as u16) << 8;
+        self.a = d[0x27];
+        self.x = d[0x28];
+        self.y = d[0x29];
+        self.psw = d[0x2A];
+        self.sp = d[0x2B];
+        self.ram.copy_from_slice(&d[0x100..0x10100]);
+        for i in 0..0x80 {
+            self.dsp.regs[i] = d[0x10100 + i];
+        }
+        self.control = self.ram[0x00F1];
+        self.dsp_addr = self.ram[0x00F2];
+        self.cpu_in = [self.ram[0x00F4], self.ram[0x00F5], self.ram[0x00F6], self.ram[0x00F7]];
+        self.cpu_out = self.cpu_in;
+        for i in 0..3 {
+            self.timers[i].target = self.ram[0x00FA + i];
+            self.timers[i].enabled = self.control >> i & 1 != 0;
+            self.timers[i].counter = 0;
+            self.timers[i].output = 0;
+        }
+        self.cyc = 0;
+        self.stage1 = 0;
+        self.stopped = false;
+    }
+
     // ----- timing -----
 
     /// Advance by master clocks; executes whole SPC cycles.
     pub fn tick(&mut self, master_cycles: u64) {
-        // 21.477272 MHz / 1.024 MHz ~= 21 master clocks per SPC cycle.
-        self.master_acc += master_cycles;
-        while self.master_acc >= 21 {
-            self.master_acc -= 21;
+        // Exact ratio: 21.477272 MHz master / 1.024 MHz SPC700 clock.
+        // (The previous fixed 21:1 made the DSP run ~0.05% slow, which
+        // drifted against the audio device and crackled.)
+        self.master_acc += master_cycles * 1_024_000;
+        while self.master_acc >= 21_477_272 {
+            self.master_acc -= 21_477_272;
             // One SPC cycle: the prescaler/DSP/timers advance every cycle, but a
             // new instruction is issued only once the previous one's cycle count
             // has elapsed (instructions take 2-8 cycles, not one).
@@ -130,7 +171,7 @@ impl Spc700 {
             self.timer_tick(0);
             self.timer_tick(1);
         }
-        self.dsp.cycle();
+        self.dsp.cycle(&mut self.ram);
     }
 
     fn timer_tick(&mut self, i: usize) {
@@ -195,7 +236,24 @@ impl Spc700 {
                 self.control = v;
             }
             0x00F2 => self.dsp_addr = v,
-            0x00F3 => self.dsp.write(self.dsp_addr, v),
+            0x00F3 => {
+                if self.dbg_trace_dsp != 0
+                    && (self.dsp_addr == self.dbg_trace_dsp
+                        || self.dsp_addr == self.dbg_trace_dsp + 1)
+                {
+                    eprintln!(
+                        "dsp[${:02X}] <- {:02X}  pc={:04X} a={:02X} x={:02X} y={:02X} psw={:02X}",
+                        self.dsp_addr, v, self.pc, self.a, self.x, self.y, self.psw
+                    );
+                    if self.dsp_addr == self.dbg_trace_dsp {
+                        for line in &self.dbg_insn_ring {
+                            eprintln!("  {line}");
+                        }
+                        self.dbg_insn_ring.clear();
+                    }
+                }
+                self.dsp.write(self.dsp_addr, v);
+            }
             0x00F4..=0x00F7 => self.cpu_out[(addr - 0xF4) as usize] = v,
             0x00FA..=0x00FC => self.timers[(addr - 0xFA) as usize].target = v,
             0x00FD..=0x00FF => {} // read-only
@@ -349,7 +407,27 @@ impl Spc700 {
 
 impl Spc700 {
     fn step(&mut self) -> u8 {
+        let op_pc = self.pc;
         let op = self.fetch8();
+        if self.dbg_trace_all {
+            eprintln!(
+                "{:04X}: {:02X}  a={:02X} x={:02X} y={:02X} psw={:02X} sp={:02X}",
+                op_pc, op, self.a, self.x, self.y, self.psw, self.sp
+            );
+        }
+        if self.dbg_trace_dsp != 0 {
+            // Ring of recent instructions for post-hoc debugging.
+            const CAP: usize = 192;
+            if self.dbg_insn_ring.len() == CAP {
+                self.dbg_insn_ring.remove(0);
+            }
+            let b1 = self.ram[(op_pc.wrapping_add(1)) as usize];
+            let b2 = self.ram[(op_pc.wrapping_add(2)) as usize];
+            self.dbg_insn_ring.push(format!(
+                "{:04X}: {:02X} {:02X} {:02X}  a={:02X} x={:02X} y={:02X} psw={:02X} sp={:02X}",
+                op_pc, op, b1, b2, self.a, self.x, self.y, self.psw, self.sp
+            ));
+        }
         match op {
             0x00 => 2, // NOP
             // ----- TCALL 0-15 -----
@@ -829,22 +907,22 @@ impl Spc700 {
     }
 
     fn div(&mut self) {
-        // algorithm from Anomie's SPC700 doc
-        let mut yva: u32 = self.ya() as u32;
-        let x: u32 = (self.x as u32) << 9;
-        for _ in 0..9 {
-            yva = (yva << 1 | yva >> 16) & 0x1FFFF;
-            if yva > x {
-                yva ^= 1;
-            }
-            if yva & 1 != 0 {
-                yva = yva.wrapping_sub(x) & 0x1FFFF;
-            }
+        // Faithful to bapu (snes9x): V = y >= x (quotient won't fit in 8 bits),
+        // H from the *original* dividend/divisor nybbles.
+        let ya = self.ya();
+        let x = self.x as u16;
+        self.set_flag(PSW_V, self.y >= self.x);
+        self.set_flag(PSW_H, (self.y & 0x0F) >= (self.x & 0x0F));
+        if (self.y as u16) < (x << 1) {
+            // quotient fits into 9 bits (x == 0 can't reach here: y < 0 is false)
+            self.a = (ya / x) as u8;
+            self.y = (ya % x) as u8;
+        } else {
+            // emulates the odd behavior of the S-SMP when the quotient
+            // won't fit into V:A (also covers x == 0: a = 255 - y, y = a)
+            self.a = 255u16.wrapping_sub((ya - (x << 9)) / (256 - x)) as u8;
+            self.y = (x + (ya - (x << 9)) % (256 - x)) as u8;
         }
-        self.y = (yva >> 9) as u8;
-        self.a = yva as u8;
-        self.set_flag(PSW_V, yva & 0x100 != 0);
-        self.set_flag(PSW_H, (self.x & 0x0F) <= (self.y & 0x0F));
         self.set_nz(self.a);
     }
 }

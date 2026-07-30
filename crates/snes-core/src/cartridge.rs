@@ -10,6 +10,7 @@ pub struct Cartridge {
     pub rom: Vec<u8>,
     map_mode: MapMode,
     title: String,
+    cart_type: u8,
 }
 
 impl Cartridge {
@@ -37,11 +38,13 @@ impl Cartridge {
         let title = String::from_utf8_lossy(&data[header..header + 21])
             .trim()
             .to_string();
+        let cart_type = data[header + 0x16];
 
         Ok(Self {
             rom: data.to_vec(),
             map_mode,
             title,
+            cart_type,
         })
     }
 
@@ -76,6 +79,11 @@ impl Cartridge {
 
     pub fn map_mode(&self) -> MapMode {
         self.map_mode
+    }
+
+    /// Cartridge type byte (header offset $16): ROM/RAM/battery/coprocessor.
+    pub fn cart_type(&self) -> u8 {
+        self.cart_type
     }
 
     pub fn rom_len(&self) -> usize {

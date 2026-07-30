@@ -19,7 +19,9 @@ pub struct Ppu {
     // --- timing ---
     master_accum: u64,
     dot: u64,
-    line: u64,
+    pub line: u64,
+    last_irq_frame: u64,
+    last_irq_line: u64,
     nmi_flag: bool,
     nmi_delay: u64,  // NMI fires N cycles after vblank starts (matches real 5A22)
     hdma_due: bool,
@@ -28,6 +30,14 @@ pub struct Ppu {
     pub wram_refresh_pending: bool,
 
     // --- registers ---
+    pub cg_writes: u32,
+    pub m7_dbg: Box<[u8; 256]>, // debug: mode 7 indices captured at line 100
+    pub m7_dbg_valid: bool,
+    pub dbg_mode_count: [u32; 8], // debug: render_scanline mode histogram
+    pub dbg_pc: u32, // debug: CPU pc at last register write
+    pub dbg_vram_log: bool, // debug: log $2116/17 VMADDR writes
+    pub dbg_scroll_log: bool, // debug: record per-scanline BG scroll in dbg_scroll_ring
+    pub dbg_scroll_ring: Vec<(u16, u16, u16, u16, u16)>, // (fb_row, hofs0, vofs0, hofs1, vofs1)
     pub inidisp: u8,
     pub obsel: u8,
     oam_addr: u16,
@@ -86,6 +96,8 @@ impl Ppu {
             master_accum: 0,
             dot: 0,
             line: 0,
+            last_irq_frame: u64::MAX,
+            last_irq_line: u64::MAX,
             nmi_flag: false,
             nmi_delay: 0,
             hdma_due: false,
@@ -111,6 +123,14 @@ impl Ppu {
             vmain: 0,
             vmadd: 0,
             vram_prefetch: 0,
+            cg_writes: 0,
+            m7_dbg: Box::new([0; 256]),
+            m7_dbg_valid: false,
+            dbg_mode_count: [0; 8],
+            dbg_vram_log: false,
+            dbg_scroll_log: false,
+            dbg_scroll_ring: Vec::new(),
+            dbg_pc: 0,
             cgadd: 0,
             cg_latch: 0,
             cg_latch_val: 0,
@@ -227,22 +247,40 @@ impl Ppu {
 
     pub fn irq_hit(&mut self, htime: u16, vtime: u16, nmitimen: u8) -> bool {
         // VT-only, HT-only, or HV coincicence; evaluated at line/dot granularity.
+        // Edge per scanline per frame: fire at most once per (frame, line) so
+        // the handler can't be re-entered repeatedly within the hit window.
+        if self.last_irq_frame == self.frame && self.last_irq_line == self.line {
+            return false;
+        }
         let mode = nmitimen & 0x30;
         let vt_hit = self.line == vtime as u64;
-        let ht_hit = self.dot >= (htime as u64) * 4 && self.dot - (htime as u64) * 4 < 8;
-        match mode {
+        // Fire once the dot has passed HTIME; the (frame, line) latch above
+        // keeps this to one hit per line. A narrow equality window would be
+        // missed between instruction-granularity polls.
+        let ht_hit = self.dot >= (htime as u64) * 4;
+        let hit = match mode {
             0x10 => ht_hit,
-            0x20 => vt_hit && self.dot < 8,
+            0x20 => vt_hit,
             0x30 => vt_hit && ht_hit,
             _ => false,
+        };
+        if hit {
+            self.last_irq_frame = self.frame;
+            self.last_irq_line = self.line;
         }
+        hit
     }
 
     // ----- CPU register interface -----
 
     pub fn read_register(&mut self, addr: u16) -> u8 {
         match addr {
-            0x2134..=0x2136 => 0, // M7 multiply results (stub)
+            0x2134..=0x2136 => {
+                // M7 multiply result: signed 16x8 product M7A * (M7B >> 8),
+                // 24-bit, low/mid/high byte per address (snes9x ppu.cpp).
+                let r = (self.m7[0] as i16 as i32) * ((self.m7[1] >> 8) as u8 as i8 as i32);
+                (r >> ((addr - 0x2134) * 8)) as u8
+            }
             0x2137 => {
                 self.hv_latch_h = (self.dot / 4) as u16;
                 self.hv_latch_v = self.line as u16;
@@ -381,10 +419,22 @@ impl Ppu {
             0x2116 => {
                 self.vmadd = (self.vmadd & 0xFF00) | v as u16;
                 self.vram_prefetch = self.read_vram_word(self.vmadd);
+                if self.dbg_vram_log {
+                    eprintln!(
+                        "VMADDL f{} l{} ={:02X} pc={:06X}",
+                        self.frame, self.line, v, self.dbg_pc
+                    );
+                }
             }
             0x2117 => {
                 self.vmadd = (self.vmadd & 0x00FF) | (v as u16) << 8;
                 self.vram_prefetch = self.read_vram_word(self.vmadd);
+                if self.dbg_vram_log {
+                    eprintln!(
+                        "VMADDH f{} l{} vmadd={:04X} pc={:06X}",
+                        self.frame, self.line, self.vmadd, self.dbg_pc
+                    );
+                }
             }
             0x2118 => {
                 self.vram[(self.vmadd as usize & 0x7FFF) * 2] = v;
@@ -405,6 +455,7 @@ impl Ppu {
                 self.cg_latch = 0;
             }
             0x2122 => {
+                self.cg_writes = self.cg_writes.wrapping_add(1);
                 if self.cg_latch == 0 {
                     self.cg_latch_val = v;
                     self.cg_latch = 1;
@@ -675,6 +726,15 @@ impl Ppu {
         if y >= HEIGHT {
             return;
         }
+        if self.dbg_scroll_log {
+            self.dbg_scroll_ring.push((
+                y as u16,
+                self.bg_hofs[0],
+                self.bg_vofs[0],
+                self.bg_hofs[1],
+                self.bg_vofs[1],
+            ));
+        }
         // INIDISP: bit 7 = forced blank (black screen), bits 3-0 = brightness.
         if self.inidisp & 0x80 != 0 {
             for x in 0..WIDTH {
@@ -684,6 +744,7 @@ impl Ppu {
         }
         let bright = (self.inidisp & 0x0F) as u32;
         let mode = self.bgmode & 7;
+        self.dbg_mode_count[mode as usize] = self.dbg_mode_count[mode as usize].wrapping_add(1);
         let bg3_hi = mode == 1 && self.bgmode & 0x08 != 0;
         // TM: main-screen layer enables (bits 0-3 = BG1-4, bit 4 = OBJ).
         let tm = self.tm;
@@ -864,7 +925,7 @@ impl Ppu {
         (self.fixed_rgb[0], self.fixed_rgb[1], self.fixed_rgb[2])
     }
 
-    fn render_mode7_line(&self, y: usize, pix: &mut [u8; WIDTH], _pri: &mut [u8; WIDTH]) {
+    fn render_mode7_line(&mut self, y: usize, pix: &mut [u8; WIDTH], _pri: &mut [u8; WIDTH]) {
         let a = self.m7[0] as i16 as i32;
         let b = self.m7[1] as i16 as i32;
         let c = self.m7[2] as i16 as i32;
@@ -898,6 +959,15 @@ impl Ppu {
             let char_byte = (tile * 64 + ((ty & 7) as usize) * 8 + ((tx & 7) as usize)) * 2 + 1;
             pix[x] = self.vram[char_byte & 0xFFFF];
         }
+        if y == 100 {
+            self.m7_dbg.copy_from_slice(pix);
+            self.m7_dbg_valid = true;
+        }
+    }
+
+    /// Debug helper: mode 7 matrix state (M7SEL, [A,B,C,D,X,Y,HOFS,VOFS]).
+    pub fn debug_m7(&self) -> (u8, [u16; 8]) {
+        (self.m7sel, self.m7)
     }
 
     /// Debug helper: render a single BG layer (raw CGRAM indices mapped to

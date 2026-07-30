@@ -3,6 +3,7 @@
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
+pub mod dsp1;
 pub mod ppu;
 pub mod spc700;
 
@@ -27,6 +28,7 @@ impl Snes {
 
     /// Run one instruction plus the bus time it consumed.
     pub fn step(&mut self) {
+        self.bus.dbg_pc = ((self.cpu.pb as u32) << 16) | self.cpu.pc as u32;
         let cycles = cpu::step(&mut self.cpu, &mut self.bus);
         self.bus.tick(cycles);
         self.bus.poll_interrupts();
