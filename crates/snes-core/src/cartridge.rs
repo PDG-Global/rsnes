@@ -11,6 +11,7 @@ pub struct Cartridge {
     map_mode: MapMode,
     title: String,
     cart_type: u8,
+    sram_size: usize,
 }
 
 impl Cartridge {
@@ -39,12 +40,22 @@ impl Cartridge {
             .trim()
             .to_string();
         let cart_type = data[header + 0x16];
+        // Header byte 0x18: SRAM size as 1 KB << n. Some carts (DSP-1 games)
+        // leave it 0 despite having battery-backed RAM; the bus falls back
+        // to 8 KB for cart types known to carry SRAM.
+        let sram_shift = data[header + 0x18];
+        let sram_size = if sram_shift > 0 && sram_shift < 16 {
+            1024usize << sram_shift
+        } else {
+            0
+        };
 
         Ok(Self {
             rom: data.to_vec(),
             map_mode,
             title,
             cart_type,
+            sram_size,
         })
     }
 
@@ -84,6 +95,10 @@ impl Cartridge {
     /// Cartridge type byte (header offset $16): ROM/RAM/battery/coprocessor.
     pub fn cart_type(&self) -> u8 {
         self.cart_type
+    }
+
+    pub fn sram_size(&self) -> usize {
+        self.sram_size
     }
 
     pub fn rom_len(&self) -> usize {

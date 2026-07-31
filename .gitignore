@@ -8,6 +8,9 @@
 # ROMs — copyrighted game images, never commit these
 /roms
 
+# Battery-backed save files written next to ROMs
+*.srm
+
 # OS / editor junk
 .DS_Store
 

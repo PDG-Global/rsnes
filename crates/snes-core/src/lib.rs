@@ -52,4 +52,28 @@ impl Snes {
     pub fn framebuffer(&self) -> &[u32] {
         &self.bus.ppu.framebuffer[..]
     }
+
+    /// Load battery-backed SRAM from a `.srm` file, if one exists. Ignores
+    /// size mismatches (a stale/foreign save must not break the game).
+    pub fn load_sram(&mut self, path: &std::path::Path) {
+        if self.bus.sram.is_empty() {
+            return;
+        }
+        if let Ok(data) = std::fs::read(path) {
+            if data.len() == self.bus.sram.len() {
+                self.bus.sram.copy_from_slice(&data);
+                self.bus.sram_dirty = false;
+            }
+        }
+    }
+
+    /// Flush SRAM to disk if the game wrote to it since the last flush.
+    pub fn save_sram(&mut self, path: &std::path::Path) {
+        if self.bus.sram.is_empty() || !self.bus.sram_dirty {
+            return;
+        }
+        if std::fs::write(path, &self.bus.sram).is_ok() {
+            self.bus.sram_dirty = false;
+        }
+    }
 }

@@ -40,8 +40,10 @@ fn main() {
     let cart = snes_core::cartridge::Cartridge::load(&data).expect("failed to parse ROM");
     eprintln!("loaded: {} ({:?}, {} bytes)", cart.title(), cart.map_mode(), cart.rom_len());
 
+    let save_path = std::path::PathBuf::from(&args[1]).with_extension("srm");
     let mut snes = snes_core::Snes::new(cart);
     snes.reset();
+    snes.load_sram(&save_path);
 
     unsafe {
         if !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) {
@@ -142,8 +144,9 @@ fn main() {
             if !paused {
                 snes.run_frame();
                 frame_count += 1;
+                // Flush battery saves periodically so a crash doesn't lose them.
                 if frame_count % 300 == 0 {
-                    eprintln!("frame {}", frame_count);
+                    snes.save_sram(&save_path);
                 }
             }
 
@@ -197,6 +200,8 @@ fn main() {
         SDL_DestroyWindow(window);
         SDL_Quit();
     }
+
+    snes.save_sram(&save_path);
 }
 
 fn keycode_to_snes(key: SDL_Keycode) -> u16 {

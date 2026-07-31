@@ -18,6 +18,8 @@ pub struct Bus {
     pub wram: Box<[u8; 0x20000]>,
     /// Battery-backed SRAM (sized from header, min 2 KiB)
     pub sram: Vec<u8>,
+    /// Set when SRAM is written; the frontend uses it to flush saves to disk.
+    pub sram_dirty: bool,
     pub ppu: Ppu,
     pub spc: Spc700,
     /// DSP-1 math coprocessor (cart types $03-$05). Only the HiROM register
@@ -78,10 +80,19 @@ impl Bus {
     pub fn new(rom: Cartridge) -> Self {
         let cart_type = rom.cart_type();
         let is_hirom = rom.map_mode() == MapMode::HiRom;
+        // Cart types with on-cart RAM: $01/$02 (LoROM), $05 (HiROM+RAM+BAT,
+        // also DSP-1+RAM+BAT per snes9x), $06 (SA-1). Header-declared size
+        // wins; otherwise fall back to 8 KiB for RAM-carrying types, 0 else.
+        let has_ram = matches!(cart_type, 0x01 | 0x02 | 0x05 | 0x06);
+        let sram_len = match rom.sram_size() {
+            0 if has_ram => 0x2000,
+            n => n,
+        };
         Self {
             rom,
             wram: Box::new([0; 0x20000]),
-            sram: vec![0; 0x2000],
+            sram: vec![0; sram_len],
+            sram_dirty: false,
             ppu: Ppu::new(),
             spc: Spc700::new(),
             dsp1: if matches!(cart_type, 0x03 | 0x04 | 0x05) {
@@ -281,10 +292,12 @@ impl Bus {
             {
                 let off = (((b & 0x0F) << 13) | (a & 0x1FFF)) % self.sram.len();
                 self.sram[off] = value;
+                self.sram_dirty = true;
             }
             (0x70..=0x7D | 0xF0..=0xFD, _) if !self.sram.is_empty() => {
                 let off = (((b & 0xF) << 15) | (a & 0x7FFF)) % self.sram.len();
                 self.sram[off] = value;
+                self.sram_dirty = true;
             }
             _ => {}
         }
