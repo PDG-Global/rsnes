@@ -217,6 +217,14 @@ repository.
 | Start  | Return      |
 | Select | Left Shift  |
 
+Gamepads are supported through SDL's gamepad layer: any controller SDL
+has a built-in mapping for works out of the box, with the face buttons
+matched positionally to the SNES diamond (south = B, east = A, west =
+Y, north = X), shoulders on L/R, and the d-pad or left stick driving
+the SNES d-pad. A mapping for the Xiaomi XMGP1-GT (native Bluetooth
+mode, pairs as XMGP1-AN) is included. Keyboard and gamepad can be used
+at the same time.
+
 ## Tests
 
 ```sh
