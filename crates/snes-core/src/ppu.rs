@@ -25,6 +25,9 @@ pub struct Ppu {
     nmi_flag: bool,
     nmi_delay: u64,  // NMI fires N cycles after vblank starts (matches real 5A22)
     hdma_due: bool,
+    /// Set at the line-0 frame wrap: HDMA pointers re-init at frame start
+    /// (snes9x S9xStartHDMA at V_Counter==0), independent of NMI timing.
+    hdma_init_due: bool,
     pub frame: u64,
     pub frame_ended: bool,
     pub wram_refresh_pending: bool,
@@ -80,7 +83,12 @@ pub struct Ppu {
     pub setini: u8,
     hv_latch_h: u16,
     hv_latch_v: u16,
-    counter_latch: u8,
+    /// $213C/$213D byte-toggle flip-flops. These are independent on hardware
+    /// (snes9x HBeamFlip/VBeamFlip): sharing one desyncs the low/high byte
+    /// order whenever a game reads the H and V counters an unbalanced number
+    /// of times. Both are cleared by a $213F (STAT78) read.
+    pub h_flip: bool,
+    pub v_flip: bool,
     stat78_lsb: bool,
 
     /// RGB888 framebuffer, WIDTH x HEIGHT.
@@ -101,6 +109,7 @@ impl Ppu {
             nmi_flag: false,
             nmi_delay: 0,
             hdma_due: false,
+            hdma_init_due: false,
             frame: 0,
             wram_refresh_pending: false,
             frame_ended: false,
@@ -152,7 +161,8 @@ impl Ppu {
             setini: 0,
             hv_latch_h: 0,
             hv_latch_v: 0,
-            counter_latch: 0,
+            h_flip: false,
+            v_flip: false,
             stat78_lsb: false,
             framebuffer: Box::new([0; WIDTH * HEIGHT]),
         }
@@ -203,6 +213,7 @@ impl Ppu {
             self.line = 0;
             self.frame_ended = true;
             self.frame = self.frame.wrapping_add(1);
+            self.hdma_init_due = true;
         }
         if self.line < vblank_start {
             self.hdma_due = true;
@@ -230,6 +241,12 @@ impl Ppu {
     pub fn take_hdma_due(&mut self) -> bool {
         let v = self.hdma_due;
         self.hdma_due = false;
+        v
+    }
+
+    pub fn take_hdma_init_due(&mut self) -> bool {
+        let v = self.hdma_init_due;
+        self.hdma_init_due = false;
         v
     }
 
@@ -316,27 +333,30 @@ impl Ppu {
                 v
             }
             0x213C => {
-                let v = if self.counter_latch == 0 {
-                    self.counter_latch = 1;
+                let v = if !self.h_flip {
+                    self.h_flip = true;
                     self.hv_latch_h as u8
                 } else {
-                    self.counter_latch = 0;
+                    self.h_flip = false;
                     (self.hv_latch_h >> 8) as u8
                 };
                 v
             }
             0x213D => {
-                let v = if self.counter_latch == 0 {
-                    self.counter_latch = 1;
+                let v = if !self.v_flip {
+                    self.v_flip = true;
                     self.hv_latch_v as u8
                 } else {
-                    self.counter_latch = 0;
+                    self.v_flip = false;
                     (self.hv_latch_v >> 8) as u8
                 };
                 v
             }
             0x213E => 0x01, // PPU1 version, no flags
             0x213F => {
+                // STAT78 read clears the H/V counter byte toggles (snes9x).
+                self.h_flip = false;
+                self.v_flip = false;
                 let v = if self.stat78_lsb { 0x01 } else { 0x00 };
                 self.stat78_lsb = !self.stat78_lsb;
                 v // NTSC, PPU2 v1
@@ -592,9 +612,12 @@ impl Ppu {
             return (0, pri);
         }
         let pal_base = match bpp {
-            // 2bpp BGs each own a 32-color CGRAM region (BG1: 0-31, BG2:
-            // 32-63, BG3: 64-95, BG4: 96-127); snes9x DO_BG StartPalette.
-            2 => layer as u8 * 32 + pal * 4,
+            // Mode 0: 2bpp BGs each own a 32-color CGRAM region (BG1: 0-31,
+            // BG2: 32-63, BG3: 64-95, BG4: 96-127). In all other modes the
+            // 2bpp layers share palette entries 0-31 (snes9x gfx.cpp DO_BG
+            // passes StartPalette 0 outside mode 0).
+            2 if self.bgmode & 7 == 0 => layer as u8 * 32 + pal * 4,
+            2 => pal * 4,
             4 => pal * 16,
             _ => 0,
         };
@@ -1118,5 +1141,29 @@ mod tests {
         ppu.render_sprites(8, &mut pix, &mut pri, &mut opq);
 
         assert_eq!(pix[20], 128 + 2, "should fetch the tile via the name-select offset");
+    }
+
+    #[test]
+    fn bg_2bpp_palette_base_depends_on_mode() {
+        // Star Fox's title logo is BG3 (2bpp, mode 1): its palette attributes
+        // must index CGRAM at pal*4+pixel, not layer*32+pal*4+pixel (the
+        // latter is only correct in mode 0). snes9x gfx.cpp DO_BG passes
+        // StartPalette 0 for 2bpp layers outside mode 0.
+        let mut ppu = Ppu::new();
+        ppu.bg_sc[2] = 0x68; // BG3 tilemap at word 0x6800 (byte 0xD000)
+        // Tilemap entry 0: tile 0, palette 6.
+        ppu.vram[0xD000] = 0x00;
+        ppu.vram[0xD001] = (6 << 2) as u8; // palette in entry bits 12-10
+        // 2bpp tile 0 at char base 0: solid pixel value 1 (plane 0 set).
+        for row in 0..8usize {
+            ppu.vram[row * 2] = 0xFF;
+            ppu.vram[row * 2 + 1] = 0x00;
+        }
+        // Mode 1: BG3 shares palettes 0-31 -> 6*4 + 1.
+        ppu.bgmode = 0x09;
+        assert_eq!(ppu.bg_pixel(2, 2, 0, 0).0, 6 * 4 + 1);
+        // Mode 0: BG3 owns colors 64-95 -> 64 + 6*4 + 1.
+        ppu.bgmode = 0x00;
+        assert_eq!(ppu.bg_pixel(2, 2, 0, 0).0, 2 * 32 + 6 * 4 + 1);
     }
 }

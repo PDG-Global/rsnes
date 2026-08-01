@@ -701,6 +701,9 @@ pub fn step(cpu: &mut Cpu, bus: &mut Bus) -> u64 {
         return 2;
     }
 
+    // snes9x S9xSetPCBase: every access of this instruction is timed at the
+    // speed of the bank the opcode is fetched from.
+    bus.code_speed = bus.memory_speed(cpu.pb, cpu.pc);
     let op = cpu.fetch8(bus);
     let m = cpu.m16() as u64; // +1 for accumulator-width memory ops
     let xi = cpu.x16() as u64; // +1 for index-width memory ops

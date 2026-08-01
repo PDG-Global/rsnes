@@ -7,10 +7,15 @@ use crate::cartridge::{Cartridge, MapMode};
 use crate::dsp1::Dsp1;
 use crate::ppu::Ppu;
 use crate::spc700::Spc700;
+use crate::superfx::SuperFx;
 
 /// Master clocks per CPU cycle. Real hardware uses 6 (fast) or 8 (slow) per access.
 /// Using 6 (fast ROM speed) as the default since most SMW accesses are to ROM ($8000+).
 const MASTER_PER_CPU_CYCLE: u64 = 6;
+
+/// Master clocks per scanline (mirrors ppu.rs DOTS_PER_LINE); used to pace the
+/// Super FX per-scanline execution budget.
+const MASTER_PER_SCANLINE: u64 = 1364;
 
 pub struct Bus {
     pub rom: Cartridge,
@@ -25,6 +30,25 @@ pub struct Bus {
     /// DSP-1 math coprocessor (cart types $03-$05). Only the HiROM register
     /// mapping is implemented (Super Mario Kart); LoROM DSP-1 mappings are not.
     pub dsp1: Option<Dsp1>,
+    /// Super FX (GSU) coprocessor (cart types $13-$15/$1A).
+    pub superfx: Option<SuperFx>,
+    /// Master-clock accumulator pacing the Super FX per-scanline budget.
+    sfx_line_accum: u64,
+    /// Wait-state accumulator: every CPU bus access charges
+    /// (memory_speed - MASTER_PER_CPU_CYCLE) extra master clocks here, so a
+    /// slow (2.68 MHz) access costs 8 master clocks total, a fast one 6,
+    /// matching snes9x's per-access accounting. Consumed by the CPU driver
+    /// once per instruction. DMA/HDMA snapshot and restore it — transfers
+    /// charge their own 8 master clocks/byte instead.
+    access_extra: u64,
+    /// Master-clock cost per bus access for the current instruction.
+    /// snes9x charges every access of an instruction at the speed of the
+    /// bank the OPCODE is fetched from (CPU.MemSpeed, set from the fetch
+    /// address), not the accessed address; the CPU sets this before each
+    /// opcode fetch.
+    pub(crate) code_speed: u64,
+    /// MEMSEL ($420D) bit 0: FastROM enable for banks $80-$FF.
+    fastrom: bool,
     /// HiROM carts with on-cart RAM map SRAM at banks $20-$3F/$A0-$BF, $6000-$7FFF.
     hirom_sram: bool,
 
@@ -80,6 +104,7 @@ impl Bus {
     pub fn new(rom: Cartridge) -> Self {
         let cart_type = rom.cart_type();
         let is_hirom = rom.map_mode() == MapMode::HiRom;
+        let rom_len = rom.rom_len();
         // Cart types with on-cart RAM: $01/$02 (LoROM), $05 (HiROM+RAM+BAT,
         // also DSP-1+RAM+BAT per snes9x), $06 (SA-1). Header-declared size
         // wins; otherwise fall back to 8 KiB for RAM-carrying types, 0 else.
@@ -100,6 +125,15 @@ impl Bus {
             } else {
                 None
             },
+            superfx: if matches!(cart_type, 0x13 | 0x14 | 0x15 | 0x1A) {
+                Some(SuperFx::new(rom_len))
+            } else {
+                None
+            },
+            sfx_line_accum: 0,
+            access_extra: 0,
+            code_speed: MASTER_PER_CPU_CYCLE,
+            fastrom: false,
             hirom_sram: is_hirom && matches!(cart_type, 0x02 | 0x05),
             wram_addr: 0,
             nmitimen: 0,
@@ -133,16 +167,69 @@ impl Bus {
         }
     }
 
+    /// Master clocks for one CPU access to this address (snes9x getset.h
+    /// memory_speed): 8 for slow regions (LoROM ROM, WRAM, most MMIO), 6 for
+    /// fast regions (low WRAM mirror, $4200-$5FFF, FastROM banks when MEMSEL
+    /// is set), 12 for the legacy $4000-$41FF joypad port.
+    pub(crate) fn memory_speed(&self, bank: u8, addr: u16) -> u64 {
+        let address = ((bank as u32) << 16) | addr as u32;
+        if address & 0x408000 != 0 {
+            if address & 0x800000 != 0 {
+                if self.fastrom { 6 } else { 8 }
+            } else {
+                8
+            }
+        } else if (address + 0x6000) & 0x4000 != 0 {
+            8
+        } else if address.wrapping_sub(0x4000) & 0x7E00 != 0 {
+            6
+        } else {
+            12
+        }
+    }
+
+    fn charge_access(&mut self, _bank: u8, _addr: u16) {
+        self.access_extra += self.code_speed - MASTER_PER_CPU_CYCLE;
+    }
+
+    /// Consume the wait states accumulated by CPU bus accesses this
+    /// instruction (called once per instruction by the CPU driver).
+    pub fn take_access_extra(&mut self) -> u64 {
+        std::mem::take(&mut self.access_extra)
+    }
+
     /// Current auto-read joypad value as seen at $4218/9 (test/debug use).
     pub fn debug_pad1(&self) -> u16 {
         self.pad1
     }
 
-    /// Advance PPU/APU by `cpu_cycles` worth of master clocks.
+    /// Advance the system by one CPU instruction's worth of time: the
+    /// instruction's flat cycle count plus the per-access wait states
+    /// charged by `charge_access` since the last call.
     pub fn tick(&mut self, cpu_cycles: u64) {
-        let master = cpu_cycles * MASTER_PER_CPU_CYCLE;
+        let extra = self.take_access_extra();
+        self.tick_master(cpu_cycles * MASTER_PER_CPU_CYCLE + extra);
+    }
+
+    /// Advance PPU/APU/GSU by raw master clocks. Everything that consumes
+    /// bus time (CPU instructions, DMA, WRAM refresh) must go through here:
+    /// the GSU is an independent chip whose clock keeps running while the
+    /// SNES CPU is stalled by DMA/refresh (snes9x fires its per-scanline
+    /// SuperFX hook from the master-clock event system, so DMA time counts).
+    fn tick_master(&mut self, master: u64) {
         self.ppu.tick(master);
         self.spc.tick(master);
+        // Super FX: snes9x runs the GSU once per scanline with a fixed
+        // instruction budget. Accumulate master clocks and fire the
+        // per-scanline hook in step with the PPU's line rate.
+        if self.superfx.is_some() {
+            self.sfx_line_accum += master;
+            while self.sfx_line_accum >= MASTER_PER_SCANLINE {
+                self.sfx_line_accum -= MASTER_PER_SCANLINE;
+                let sfx = self.superfx.as_mut().unwrap();
+                sfx.exec_line(&self.rom.rom);
+            }
+        }
     }
 
     /// Called after PPU tick in the driver loop to latch NMI/IRQ into the CPU.
@@ -154,6 +241,12 @@ impl Bus {
             }
             // Auto joypad read at vblank start
             self.pad1 = self.pad1_bits;
+        }
+        // HDMA pointers re-init at the line-0 frame wrap (snes9x
+        // S9xStartHDMA at V_Counter==0), not at NMI time: a long DMA burn
+        // spanning vblank would otherwise reset the tables dozens of lines
+        // into the visible frame (Star Fox letterbox flicker).
+        if self.ppu.take_hdma_init_due() {
             self.hdma_frame_reset();
         }
         if self.ppu.take_hdma_due() {
@@ -162,8 +255,7 @@ impl Bus {
         // WRAM refresh: steal 40 master clocks (5 CPU cycles) per visible scanline
         if self.ppu.wram_refresh_pending {
             self.ppu.wram_refresh_pending = false;
-            self.ppu.tick(40); // 40 master clocks = 10 dots
-            self.spc.tick(40);
+            self.tick_master(40); // 40 master clocks = 10 dots
         }
         if self.ppu.frame_ended {
             self.ppu.frame_ended = false;
@@ -176,7 +268,16 @@ impl Bus {
         }
     }
 
+    /// CPU /IRQ input: the H/V timer latch OR the Super FX level output.
+    /// The GSU line deasserts when the SNES reads SFR high ($3031); it must
+    /// not be latched into `irq_line` or the CPU would re-take the IRQ after
+    /// the handler's RTI (snes9x keeps it as a separate CPU.IRQExternal).
+    pub fn cpu_irq(&self) -> bool {
+        self.irq_line || self.superfx.as_ref().is_some_and(|s| s.irq_line)
+    }
+
     pub fn read(&mut self, bank: u8, addr: u16) -> u8 {
+        self.charge_access(bank, addr);
         let (b, a) = (bank as usize, addr as usize);
         if a < 0x2000 && (b < 0x40 || (0x80..0xC0).contains(&b)) {
             self.open_bus = self.wram[a];
@@ -224,6 +325,18 @@ impl Bus {
                 let off = (((b & 0x0F) << 13) | (a & 0x1FFF)) % self.sram.len();
                 self.sram[off]
             }
+            // Super FX registers: $3000-$32FF, banks $00-$3F/$80-$BF.
+            (0x00..=0x3F | 0x80..=0xBF, 0x3000..=0x32FF) if self.superfx.is_some() => {
+                self.superfx.as_mut().unwrap().read_register(addr)
+            }
+            // Super FX GSU RAM: first 8KB at $6000-$7FFF (banks $00-$3F/$80-$BF).
+            (0x00..=0x3F | 0x80..=0xBF, 0x6000..=0x7FFF) if self.superfx.is_some() => {
+                self.superfx.as_ref().unwrap().ram[a - 0x6000]
+            }
+            // Super FX GSU RAM: full 64KB at banks $70/$71 and $F0/$F1.
+            (0x70 | 0x71 | 0xF0 | 0xF1, _) if self.superfx.is_some() => {
+                self.superfx.as_ref().unwrap().ram[((b & 1) << 16) | a]
+            }
             // SRAM (LoROM): banks $70-$7D (and mirrors $F0-$FD), $0000-$FFFF
             // Address formula matches snes9x: ((bank << 15) | (addr & 0x7FFF)) & SRAMMask
             (0x70..=0x7D | 0xF0..=0xFD, _) if !self.sram.is_empty() => {
@@ -243,6 +356,7 @@ impl Bus {
     }
 
     pub fn write(&mut self, bank: u8, addr: u16, value: u8) {
+        self.charge_access(bank, addr);
         let (b, a) = (bank as usize, addr as usize);
         if a < 0x2000 && (b < 0x40 || (0x80..0xC0).contains(&b)) {
             self.wram[a] = value;
@@ -293,6 +407,20 @@ impl Bus {
                 let off = (((b & 0x0F) << 13) | (a & 0x1FFF)) % self.sram.len();
                 self.sram[off] = value;
                 self.sram_dirty = true;
+            }
+            // Super FX registers: $3000-$32FF, banks $00-$3F/$80-$BF. A write
+            // can start the GSU; its IRQ output is sampled via cpu_irq().
+            (0x00..=0x3F | 0x80..=0xBF, 0x3000..=0x32FF) if self.superfx.is_some() => {
+                let sfx = self.superfx.as_mut().unwrap();
+                sfx.write_register(addr, value, &self.rom.rom);
+            }
+            // Super FX GSU RAM: first 8KB at $6000-$7FFF (banks $00-$3F/$80-$BF).
+            (0x00..=0x3F | 0x80..=0xBF, 0x6000..=0x7FFF) if self.superfx.is_some() => {
+                self.superfx.as_mut().unwrap().ram[a - 0x6000] = value;
+            }
+            // Super FX GSU RAM: full 64KB at banks $70/$71 and $F0/$F1.
+            (0x70 | 0x71 | 0xF0 | 0xF1, _) if self.superfx.is_some() => {
+                self.superfx.as_mut().unwrap().ram[((b & 1) << 16) | a] = value;
             }
             (0x70..=0x7D | 0xF0..=0xFD, _) if !self.sram.is_empty() => {
                 let off = (((b & 0xF) << 15) | (a & 0x7FFF)) % self.sram.len();
@@ -385,6 +513,7 @@ impl Bus {
                 }
             }
             0x420C => self.hdma_active = value,
+            0x420D => self.fastrom = value & 1 != 0,
             _ => {}
         }
     }
@@ -466,6 +595,10 @@ impl Bus {
     ];
 
     fn run_dma(&mut self, ch: usize) -> u64 {
+        // DMA transfers charge their own 8 master clocks/byte; the bus
+        // accesses below must not also accumulate CPU wait states.
+        let saved_extra = self.access_extra;
+        self.access_extra = 0;
         let d = self.dma_channels[ch];
         let count = if d.size == 0 { 0x10000 } else { d.size as usize };
         let to_b = d.control & 0x80 == 0; // A->B when bit7=0
@@ -483,8 +616,7 @@ impl Bus {
         // Check for invalid WRAM-to-WRAM DMA ($7E/$7F bank -> $2180)
         let invalid = (d.a_bank == 0x7E || d.a_bank == 0x7F) && d.b_reg == 0x80 && to_b;
         // Setup cost: 8 master clocks
-        self.ppu.tick(8);
-        self.spc.tick(8);
+        self.tick_master(8);
         let mut cycles: u64 = 8;
         for i in 0..count {
             let b_addr = 0x2100 | (d.b_reg as u16).wrapping_add(Self::DMA_OFFSETS[mode][i & 3] as u16);
@@ -498,9 +630,8 @@ impl Bus {
                 }
             }
             a_addr = a_addr.wrapping_add(step as u16);
-            // Per-byte: tick PPU and APU (8 master clocks = 1 CPU cycle)
-            self.ppu.tick(8);
-            self.spc.tick(8);
+            // Per-byte: 8 master clocks = 1 CPU cycle
+            self.tick_master(8);
             cycles += 8;
             // Hardware DMA runs to completion even across a frame boundary;
             // pending NMI/frame events are latched by ppu.tick() and handled
@@ -508,13 +639,19 @@ impl Bus {
             // different: it fires once per scanline, so a long DMA spanning
             // several scanlines must service it inline — coalescing the
             // hdma_due flag would drop line counts and desync per-scanline
-            // HDMA tables (e.g. Mario Kart's Mode 7 matrix).
+            // HDMA tables (e.g. Mario Kart's Mode 7 matrix). The line-0
+            // pointer re-init must likewise fire inline when the transfer
+            // spans the frame wrap.
+            if self.ppu.take_hdma_init_due() {
+                self.hdma_frame_reset();
+            }
             if self.ppu.take_hdma_due() {
                 self.run_hdma();
             }
         }
         self.dma_channels[ch].a_addr = a_addr;
         self.mdma_pending = true;
+        self.access_extra = saved_extra;
         cycles
     }
 
@@ -534,6 +671,7 @@ impl Bus {
 
     /// Debug: raw table bytes for the channel targeting B-register `breg`.
     pub fn debug_hdma_table(&mut self, breg: u8) -> String {
+        let saved_extra = std::mem::take(&mut self.access_extra);
         for ch in 0..8 {
             let d = self.dma_channels[ch];
             if d.b_reg == breg {
@@ -542,14 +680,24 @@ impl Bus {
                     let v = self.read(d.a_bank, d.a_addr.wrapping_add(i));
                     s += &format!(" {:02X}", v);
                 }
+                self.access_extra = saved_extra;
                 return s;
             }
         }
+        self.access_extra = saved_extra;
         "no channel".to_string()
     }
 
     /// HDMA: called at the start of each visible scanline by the driver.
     pub fn run_hdma(&mut self) {
+        // HDMA bus accesses must not charge CPU wait states: this runs between
+        // instructions, so phantom cycles would be billed to the next one.
+        let saved_extra = std::mem::take(&mut self.access_extra);
+        self.run_hdma_inner();
+        self.access_extra = saved_extra;
+    }
+
+    fn run_hdma_inner(&mut self) {
         for ch in 0..8 {
             if self.hdma_active >> ch & 1 == 0 {
                 continue;
@@ -624,7 +772,8 @@ impl Bus {
         }
     }
 
-    /// Called at vblank start: reload HDMA table pointers for the next frame.
+    /// Called at the line-0 frame wrap: reload HDMA table pointers for the
+    /// new frame (snes9x S9xStartHDMA at V_Counter==0).
     pub fn hdma_frame_reset(&mut self) {
         for ch in 0..8 {
             let d = &mut self.dma_channels[ch];

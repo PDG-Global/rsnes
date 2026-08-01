@@ -6,6 +6,7 @@ pub mod cpu;
 pub mod dsp1;
 pub mod ppu;
 pub mod spc700;
+pub mod superfx;
 
 pub struct Snes {
     pub cpu: cpu::Cpu,
@@ -36,7 +37,7 @@ impl Snes {
             self.bus.nmi_line = false;
             self.cpu.nmi_pending = true;
         }
-        self.cpu.irq_pending = self.bus.irq_line;
+        self.cpu.irq_pending = self.bus.cpu_irq();
     }
 
     /// Run until the PPU completes a frame.
