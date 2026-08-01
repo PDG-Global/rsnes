@@ -16,3 +16,7 @@
 
 # local tooling state
 /.mimocode
+
+# Release build script and artifacts (local only)
+/scripts
+/dist
